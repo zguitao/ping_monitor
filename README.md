@@ -16,8 +16,4 @@
 python ping_monitor.py
 ```
 
-## 忽略文件
 
-- `ping_history.db`（本地数据库）
-- Python 缓存文件
-- 虚拟环境目录
