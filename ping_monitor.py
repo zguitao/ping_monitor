@@ -17,7 +17,8 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode M
 plt.rcParams['axes.unicode_minus'] = False
 
 # ==================== 常量配置 ====================
-TARGET_WAN = "223.5.5.5"
+# 外网监控目标（按优先级排序，当前目标失败时自动切换到下一项）
+WAN_TARGETS = ["223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"]
 
 # 常见网关地址（获取失败时轮询）
 COMMON_GATEWAYS = ("192.168.1.1", "192.168.0.1", "10.0.0.1", "192.168.31.1")
@@ -100,6 +101,7 @@ class NetworkMonitorApp:
         self.is_running = True
         self.lat_wan = -1.0
         self.lat_lan = -1.0
+        self.current_wan_target = WAN_TARGETS[0]
         self._lock = threading.Lock()
 
         self.setup_ui()
@@ -154,7 +156,7 @@ class NetworkMonitorApp:
 
         self.status_wan_label = tk.Label(
             header_frame,
-            text=f"外网 ({TARGET_WAN}): 正在检测...",
+            text=f"外网 ({WAN_TARGETS[0]}): 正在检测...",
             font=("Microsoft YaHei", 14, "bold"),
             bg="#2c3e50", fg="white"
         )
@@ -241,7 +243,7 @@ class NetworkMonitorApp:
 
         self.wan_ui = self._create_monitor_section(
             self.scrollable_frame,
-            f"🌐 外网链路监控 (Internet - {TARGET_WAN})",
+            f"🌐 外网链路监控 (Internet - {WAN_TARGETS[0]})",
             "#3498db"
         )
         self.lan_ui = self._create_monitor_section(
@@ -362,11 +364,15 @@ class NetworkMonitorApp:
             was_offline = False
             outage_start = None
 
+            # 判断当前线程职责：WAN 线程需要自动切换备用目标
+            is_wan = (target_ip == WAN_TARGETS[0])
+            current_target = target_ip
+
             # 恢复上次未结束的中断
             c.execute(
                 "SELECT start_time FROM outages_v2 WHERE end_time IS NULL "
                 "AND ip = ? ORDER BY start_time DESC LIMIT 1",
-                (target_ip,)
+                (current_target,)
             )
             row = c.fetchone()
             if row:
@@ -374,12 +380,24 @@ class NetworkMonitorApp:
                 outage_start = row[0]
 
             while self.is_running:
-                latency = self.ping_ip(target_ip)
+                latency = self.ping_ip(current_target)
 
-                # 线程安全更新共享延迟值
+                # WAN 线程：当前目标失败时自动尝试备用目标
+                if latency == -1 and is_wan:
+                    for alt in WAN_TARGETS:
+                        if alt == current_target:
+                            continue
+                        alt_lat = self.ping_ip(alt)
+                        if alt_lat != -1:
+                            current_target = alt
+                            latency = alt_lat
+                            break
+
+                # 线程安全更新共享延迟值和当前活跃目标
                 with self._lock:
-                    if target_ip == TARGET_WAN:
+                    if is_wan:
                         self.lat_wan = latency
+                        self.current_wan_target = current_target
                     else:
                         self.lat_lan = latency
 
@@ -388,7 +406,7 @@ class NetworkMonitorApp:
                     try:
                         c.execute(
                             "INSERT INTO ping_data_v2 VALUES (?, ?, ?)",
-                            (now, target_ip, latency)
+                            (now, current_target, latency)
                         )
                         if latency == -1:
                             if not was_offline:
@@ -397,7 +415,7 @@ class NetworkMonitorApp:
                                 c.execute(
                                     "INSERT INTO outages_v2 (start_time, end_time, ip) "
                                     "VALUES (?, NULL, ?)",
-                                    (outage_start, target_ip)
+                                    (outage_start, current_target)
                                 )
                         else:
                             if was_offline:
@@ -405,7 +423,7 @@ class NetworkMonitorApp:
                                 c.execute(
                                     "UPDATE outages_v2 SET end_time = ? "
                                     "WHERE start_time = ? AND ip = ?",
-                                    (now, outage_start, target_ip)
+                                    (now, outage_start, current_target)
                                 )
                                 outage_start = None
 
@@ -431,7 +449,7 @@ class NetworkMonitorApp:
     def start_monitor_threads(self):
         """启动双线程分别监控外网和网关"""
         self.thread_wan = threading.Thread(
-            target=self.monitor_loop, args=(TARGET_WAN,), daemon=True
+            target=self.monitor_loop, args=(WAN_TARGETS[0],), daemon=True
         )
         self.thread_lan = threading.Thread(
             target=self.monitor_loop, args=(TARGET_LAN,), daemon=True
@@ -450,12 +468,16 @@ class NetworkMonitorApp:
             lan_lat = self.lat_lan
 
         if wan_ok:
+            with self._lock:
+                current_wan = self.current_wan_target
             self.status_wan_label.config(
-                text=f"🌐 外网 ({TARGET_WAN}): 正常 ({wan_lat} ms)", fg="#2ecc71"
+                text=f"🌐 外网 ({current_wan}): 正常 ({wan_lat} ms)", fg="#2ecc71"
             )
         else:
+            with self._lock:
+                current_wan = self.current_wan_target
             self.status_wan_label.config(
-                text=f"🌐 外网 ({TARGET_WAN}): 丢包断开", fg="#e74c3c"
+                text=f"🌐 外网 ({current_wan}): 丢包断开", fg="#e74c3c"
             )
 
         if lan_ok:
@@ -540,7 +562,7 @@ class NetworkMonitorApp:
 
     def update_graphs(self):
         """定时刷新两张图表的趋势数据（每秒）"""
-        self._draw_charts(self.wan_ui, TARGET_WAN, "外网")
+        self._draw_charts(self.wan_ui, self.current_wan_target, "外网")
         self._draw_charts(self.lan_ui, TARGET_LAN, "网关")
         self.root.after(UI_INTERVAL_MS, self.update_graphs)
 
@@ -598,7 +620,7 @@ class NetworkMonitorApp:
 
     def update_tables(self):
         """定时刷新两侧表格（每 5 秒）"""
-        self._refresh_table_data(self.wan_ui, TARGET_WAN)
+        self._refresh_table_data(self.wan_ui, self.current_wan_target)
         self._refresh_table_data(self.lan_ui, TARGET_LAN)
         self.root.after(TABLE_INTERVAL_MS, self.update_tables)
 
@@ -649,10 +671,12 @@ class NetworkMonitorApp:
             conn = sqlite3.connect(DB_NAME, timeout=5)
             c = conn.cursor()
 
+            wan_placeholders = ','.join('?' * len(WAN_TARGETS))
+
             c.execute(
-                "SELECT start_time FROM outages_v2 "
-                "WHERE ip = ? ORDER BY start_time DESC",
-                (TARGET_WAN,)
+                f"SELECT start_time FROM outages_v2 "
+                f"WHERE ip IN ({wan_placeholders}) ORDER BY start_time DESC",
+                WAN_TARGETS
             )
             wan_outages = c.fetchall()
 
@@ -663,11 +687,11 @@ class NetworkMonitorApp:
                 t_start = row[0]
                 time_str = datetime.fromtimestamp(t_start).strftime('%m-%d %H:%M:%S')
 
-                # 动态查找：在案发前后 3 秒内网关的连通状态
+                # 动态查找：在案发前后 3 秒内网关的连通状态（排除所有外网目标 IP）
                 c.execute(
-                    "SELECT ip, MIN(latency) FROM ping_data_v2 "
-                    "WHERE ip != ? AND timestamp BETWEEN ? AND ? GROUP BY ip",
-                    (TARGET_WAN, t_start - 3, t_start + 3)
+                    f"SELECT ip, MIN(latency) FROM ping_data_v2 "
+                    f"WHERE ip NOT IN ({wan_placeholders}) AND timestamp BETWEEN ? AND ? GROUP BY ip",
+                    (*WAN_TARGETS, t_start - 3, t_start + 3)
                 )
                 lan_status_result = c.fetchone()
 
